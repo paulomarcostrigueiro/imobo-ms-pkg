@@ -58,6 +58,11 @@ type Claims struct {
 
 	// Permissions sao as permissoes do usuario no tenant operado.
 	Permissions []string
+
+	// Srv e a lista de servicos contratados/ativos do tenant operado (claim
+	// `srv` — entitlement, LEI-MS #40). Vazio quando ausente. Reflete o tenant
+	// ACTED-AS (quando master opera como tenant Y, `srv` = servicos de Y).
+	Srv []string
 }
 
 // JWTValidator valida tokens JWT e retorna os claims canonicos.
@@ -211,13 +216,16 @@ func buildTenantContext(
 		visible = []uuid.UUID{actingAs}
 	}
 
-	// Promoção SUPER-MASTER IMOBO: se o home tenant do usuario eh o master
-	// root UUID (00000000-...), eleva IsMasterImobo=true independente do que
-	// o resolver disser. Padrao Impersonate (Stripe/Slack/GitHub) — Paulo
-	// 2026-06-03: super-master conserva poderes ao atuar em tenant inferior,
-	// mas o cargo virtual no JWT vira ADMIN_IMOBILIARIA pra UI renderizar
-	// como o admin real veria. Flag IsMasterImobo decide gates de permissao.
-	if IsMasterRootTenant(homeTenantID) {
+	// Promoção SUPER-MASTER IMOBO (R1, 2026-06-19 — endurecido):
+	// promove IsMasterImobo=true SOMENTE com DEFESA DUPLA:
+	//   1. home_tenant == MASTER_ROOT_TENANT_ID (UUID real configurado por env;
+	//      se a env estiver ausente/invalida/nil, NUNCA promove — fail-closed); E
+	//   2. cargo (claim ASSINADO) == "MASTER_IMOBO".
+	// Sem o cargo certo, nao vira master mesmo com o home certo; sem o home
+	// certo, idem. Substitui o antigo sentinela uuid.Nil (adivinhavel).
+	// Padrao Impersonate (Stripe/Slack/GitHub): super-master conserva poderes ao
+	// atuar em tenant inferior; flag IsMasterImobo decide gates de permissao.
+	if shouldPromoteMaster(homeTenantID, claims.Cargo) {
 		isMaster = true
 	}
 
@@ -230,6 +238,7 @@ func buildTenantContext(
 		Permissions:      append([]string(nil), claims.Permissions...),
 		VisibleTenantIDs: visible,
 		IsMasterImobo:    isMaster,
+		Servicos:         append([]string(nil), claims.Srv...),
 	}, nil
 }
 
@@ -264,4 +273,42 @@ func writeAuthError(w http.ResponseWriter, r *http.Request, err error) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_, _ = w.Write([]byte(body))
+}
+
+// RequireService retorna um middleware HTTP que bloqueia (403
+// "servico_nao_contratado") qualquer request cujo TenantContext NAO inclua o
+// servico `nome` na lista de servicos contratados/ativos (entitlement —
+// LEI-MS #40).
+//
+// Pre-requisito: HTTPMiddleware DEVE rodar ANTES de RequireService (e quem
+// popula o TenantContext, incluindo Servicos a partir do claim `srv`). Se o ctx
+// nao tiver TenantContext, RequireService bloqueia com 403 (fail-closed) — o
+// entitlement ausente nunca libera acesso.
+//
+// O entitlement reflete o tenant ACTED-AS: quando o master opera como tenant Y,
+// `srv` = servicos de Y. NAO ha bypass especial pra master — o claim ja reflete
+// o tenant operado. Front so LE; quem VALIDA e este middleware (servidor).
+func RequireService(nome string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !HasService(r.Context(), nome) {
+				writeServiceForbidden(w, r, nome)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// writeServiceForbidden escreve a resposta canonica 403 de entitlement negado.
+func writeServiceForbidden(w http.ResponseWriter, r *http.Request, nome string) {
+	slog.WarnContext(r.Context(), "tenantctx: servico nao contratado",
+		"path", r.URL.Path,
+		"method", r.Method,
+		"servico", nome,
+		"status", http.StatusForbidden,
+	)
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusForbidden)
+	_, _ = w.Write([]byte(`{"error":"servico_nao_contratado"}`))
 }

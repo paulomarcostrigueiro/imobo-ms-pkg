@@ -31,27 +31,71 @@ package tenantctx
 
 import (
 	"context"
+	"os"
 	"strings"
 
 	"github.com/google/uuid"
 )
 
-// MasterRootTenantUUID e o tenant_id reservado para a IMOBO (operadora da
-// plataforma). Usuarios cujo HomeTenantID coincide com esta constante sao
-// SUPER-MASTER IMOBO e ganham IsMasterImobo=true automaticamente, mesmo
-// se o cargo no DB esteja como ADMIN_IMOBILIARIA (Paulo 2026-06-03).
+// EnvMasterRootTenantID e o nome da variavel de ambiente que define o tenant_id
+// reservado para a IMOBO (operadora da plataforma). DEVE conter um UUID REAL,
+// nao-nil. Quando ausente, vazio, invalido ou nil-uuid, o sistema NUNCA promove
+// usuarios a SUPER-MASTER IMOBO (fail-closed).
 //
-// Padrao Impersonate (Stripe/Slack/GitHub): super-master pode "atuar como"
-// outro tenant — UI renderiza como o admin real veria (cargo virtual
-// ADMIN_IMOBILIARIA), mas as gates de permissao master continuam ativas
-// via IsMasterImobo flag.
-var MasterRootTenantUUID = uuid.MustParse("00000000-0000-0000-0000-000000000000")
+// SECURITY (R1, 2026-06-19): substitui a antiga constante MasterRootTenantUUID =
+// uuid.Nil (00000000-...). Usar o zero-value como sentinela era um risco: o valor
+// e adivinhavel e qualquer token forjado com home_tenant = nil-uuid era promovido
+// a master. Agora o sentinela e um UUID secreto/operacional configurado por env,
+// e a promocao exige defesa dupla (home == master-root E cargo == MASTER_IMOBO).
+const EnvMasterRootTenantID = "MASTER_ROOT_TENANT_ID"
 
-// IsMasterRootTenant retorna true se o tenant id passado for o master root
-// (operadora IMOBO). Usado pelo HTTPMiddleware pra promover IsMasterImobo
-// quando home_tenant == master root.
+// CargoMasterImobo e o valor canonico do claim `cargo` exigido (em conjunto com
+// o home tenant == master-root) para promover IsMasterImobo. Defesa dupla: o
+// cargo vem do JWT ASSINADO pela plataforma, logo nao e forjavel sem a chave.
+const CargoMasterImobo = "MASTER_IMOBO"
+
+// masterRootTenantID le e parseia EnvMasterRootTenantID. Retorna (id, true)
+// SOMENTE quando a env contiver um UUID valido e NAO-nil. Em qualquer outra
+// situacao (ausente, vazia, invalida, nil-uuid) retorna (uuid.Nil, false) —
+// comportamento fail-closed: sem master-root configurado, ninguem vira master.
+func masterRootTenantID() (uuid.UUID, bool) {
+	raw := strings.TrimSpace(os.Getenv(EnvMasterRootTenantID))
+	if raw == "" {
+		return uuid.Nil, false
+	}
+	id, err := uuid.Parse(raw)
+	if err != nil {
+		return uuid.Nil, false
+	}
+	if id == uuid.Nil {
+		// nil-uuid NUNCA e aceito como sentinela de master-root.
+		return uuid.Nil, false
+	}
+	return id, true
+}
+
+// IsMasterRootTenant retorna true se o tenant id passado for EXATAMENTE o
+// master-root configurado por env (EnvMasterRootTenantID) e este for um UUID
+// real nao-nil. Se a env nao estiver configurada (ou for invalida/nil), retorna
+// sempre false — nenhum tenant e considerado master-root (fail-closed).
+//
+// ATENCAO: ser master-root e CONDICAO NECESSARIA mas NAO suficiente para virar
+// master. A promocao a IsMasterImobo exige tambem cargo == MASTER_IMOBO (ver
+// buildTenantContext / shouldPromoteMaster). Use esta funcao apenas para checar
+// o tenant; nao a use sozinha como gate de permissao.
 func IsMasterRootTenant(tenantID uuid.UUID) bool {
-	return tenantID == MasterRootTenantUUID
+	root, ok := masterRootTenantID()
+	if !ok {
+		return false
+	}
+	return tenantID == root
+}
+
+// shouldPromoteMaster aplica a regra de defesa dupla do R1: promove a
+// IsMasterImobo SOMENTE quando o home tenant coincide com o master-root
+// configurado E o cargo (claim assinado) for exatamente MASTER_IMOBO.
+func shouldPromoteMaster(homeTenantID uuid.UUID, cargo string) bool {
+	return IsMasterRootTenant(homeTenantID) && cargo == CargoMasterImobo
 }
 
 // ctxKey e o tipo nao-exportado usado como chave do TenantContext no
@@ -116,6 +160,15 @@ type TenantContext struct {
 	// IsMasterImobo indica se o usuario tem papel OPERADOR_IMOBO. Operadores
 	// IMOBO sao os unicos com acesso cross-tenant (hierarquia BPaaS).
 	IsMasterImobo bool
+
+	// Servicos e a lista de servicos contratados/ativos do tenant OPERADO
+	// (entitlement — LEI-MS #40). Vem do claim `srv` do JWT de sessao, assinado
+	// pela plataforma. Reflete sempre o tenant ACTED-AS: quando o master opera
+	// como tenant Y, `srv` = servicos de Y. Vazio quando o claim estiver ausente.
+	//
+	// NAO ha bypass especial pra master: o claim ja reflete o tenant operado.
+	// Front so LE este campo; quem VALIDA e o servidor (RequireService).
+	Servicos []string
 }
 
 // Inject coloca o TenantContext no context.Context, retornando um novo ctx
@@ -175,4 +228,30 @@ func (tc TenantContext) VisibleTenantIDsSQL() string {
 		parts = append(parts, id.String())
 	}
 	return "{" + strings.Join(parts, ",") + "}"
+}
+
+// HasServico retorna true se o servico `nome` estiver na lista de servicos
+// contratados/ativos do TenantContext (entitlement — LEI-MS #40). A comparacao
+// e exata (case-sensitive). Lista vazia => sempre false (fail-closed).
+func (tc TenantContext) HasServico(nome string) bool {
+	for _, s := range tc.Servicos {
+		if s == nome {
+			return true
+		}
+	}
+	return false
+}
+
+// HasService verifica se o tenant operado no ctx tem o servico `nome`
+// contratado/ativo (entitlement — LEI-MS #40). Retorna false se nao houver
+// TenantContext no ctx, ou se o servico nao estiver na lista (fail-closed).
+//
+// Use para gates programaticas dentro de handlers. Para proteger rotas inteiras,
+// prefira o middleware RequireService.
+func HasService(ctx context.Context, nome string) bool {
+	tc, ok := From(ctx)
+	if !ok {
+		return false
+	}
+	return tc.HasServico(nome)
 }
