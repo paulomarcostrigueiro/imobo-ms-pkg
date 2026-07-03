@@ -230,6 +230,27 @@ func (tc TenantContext) VisibleTenantIDsSQL() string {
 	return "{" + strings.Join(parts, ",") + "}"
 }
 
+// MasterVisaoGlobal indica se esta sessao deve ter VISIBILIDADE global
+// cross-tenant no RLS (bypass do escopo por tenant). Vale SOMENTE para o master
+// IMOBO quando ele NAO esta impersonando um tenant especifico — ou seja, quando
+// o tenant operado coincide com o home (acting_as == home).
+//
+// SECURITY (2026-07-03): separa os dois papeis que a flag IsMasterImobo
+// acumulava. IsMasterImobo continua indicando PERMISSAO (o que o master pode
+// fazer, usado nos gates de UI/endpoint). MasterVisaoGlobal indica
+// VISIBILIDADE. Ao "entrar como" um tenant (acting_as != home), a visibilidade
+// COLAPSA para app.tenant_ids_visiveis (o tenant operado), mesmo o master
+// conservando poderes de permissao. Sem isso, a clausula `OR is_master_imobo`
+// das policies RLS anulava o escopo do acting-as e vazava todos os tenants.
+//
+// Os caminhos de bypass de SISTEMA (login por email, aceite de convite, webhook
+// de provedor, entitlement S2S) montam o contexto com ActedAsTenantID ==
+// HomeTenantID (mesmo placeholder), entao continuam com visao global — o lookup
+// pre-auth deles depende disso e NAO e quebrado por esta regra.
+func (tc TenantContext) MasterVisaoGlobal() bool {
+	return tc.IsMasterImobo && tc.ActedAsTenantID == tc.HomeTenantID
+}
+
 // HasServico retorna true se o servico `nome` estiver na lista de servicos
 // contratados/ativos do TenantContext (entitlement — LEI-MS #40). A comparacao
 // e exata (case-sensitive). Lista vazia => sempre false (fail-closed).

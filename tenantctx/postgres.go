@@ -116,8 +116,16 @@ func applySetLocals(ctx context.Context, tx pgx.Tx, tc TenantContext) error {
 	// Postgres nao aceita placeholder em SET LOCAL, mas set_config aceita — isso
 	// elimina qualquer interpolacao de string no contexto que define a RLS
 	// (defesa em profundidade contra SQL injection no isolamento por tenant).
+	// SECURITY (2026-07-03): o GUC app.is_master_imobo governa o BYPASS DE
+	// VISIBILIDADE das policies RLS (`... OR is_master_imobo`). Ele so pode ser
+	// 'true' quando o master NAO esta impersonando (acting_as == home) — ver
+	// TenantContext.MasterVisaoGlobal. Ao "entrar como" um tenant, emitimos
+	// 'false' e a visibilidade colapsa para app.tenant_ids_visiveis (o tenant
+	// operado). As PERMISSOES do master (TenantContext.IsMasterImobo, gates Go)
+	// nao mudam — so a visibilidade no banco. Corrige o vazamento cross-tenant
+	// sob acting-as sem tocar nas ~48 policies existentes.
 	masterFlag := "false"
-	if tc.IsMasterImobo {
+	if tc.MasterVisaoGlobal() {
 		masterFlag = "true"
 	}
 	settings := []struct{ name, value string }{

@@ -125,15 +125,25 @@ func applySchema(t *testing.T, pool *pgxpool.Pool) {
             criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )`,
 
+		// SECURITY: as policies de teste replicam EXATAMENTE a forma de producao
+		// (com `OR is_master_imobo` e os guards NULLIF/COALESCE), senao o teste
+		// exercitaria um SQL diferente do que roda no cliente e nao pegaria o
+		// vazamento de impersonacao. Ver TestRLS_MasterActingAs_NaoVeOutroTenant.
 		`ALTER TABLE lancamento ENABLE ROW LEVEL SECURITY`,
 		`ALTER TABLE lancamento FORCE ROW LEVEL SECURITY`,
 		`CREATE POLICY tenant_isolation ON lancamento
-            USING (tenant_id = ANY(current_setting('app.tenant_ids_visiveis', true)::uuid[]))`,
+            USING (
+                tenant_id = ANY(NULLIF(current_setting('app.tenant_ids_visiveis', true), '')::uuid[])
+                OR COALESCE(NULLIF(current_setting('app.is_master_imobo', true), ''), 'false')::boolean
+            )`,
 
 		`ALTER TABLE acao_log ENABLE ROW LEVEL SECURITY`,
 		`ALTER TABLE acao_log FORCE ROW LEVEL SECURITY`,
 		`CREATE POLICY tenant_isolation ON acao_log
-            USING (tenant_id = ANY(current_setting('app.tenant_ids_visiveis', true)::uuid[]))`,
+            USING (
+                tenant_id = ANY(NULLIF(current_setting('app.tenant_ids_visiveis', true), '')::uuid[])
+                OR COALESCE(NULLIF(current_setting('app.is_master_imobo', true), ''), 'false')::boolean
+            )`,
 	}
 
 	for _, s := range stmts {
@@ -285,6 +295,111 @@ func TestRLS_MasterIMOBO_VeApenasActingAs(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Contains(t, visible, idPinheiros)
+}
+
+// TestRLS_MasterActingAs_NaoVeOutroTenant e o CONTROLE NEGATIVO (LEI #38) do
+// vazamento cross-tenant sob impersonacao: o master IMOBO "entrando como" o
+// tenant A (acting_as=A, home=root) NAO pode ver linha do tenant B, mesmo com
+// IsMasterImobo=true, porque MasterVisaoGlobal()=false (acting_as != home) e o
+// GUC app.is_master_imobo e emitido 'false'.
+//
+// PROVA DE FALHA REAL: com a policy de producao (`OR is_master_imobo`) e a
+// regra ANTIGA (emitir is_master='true' sempre que IsMasterImobo), este teste
+// FALHA — o master ve idB de outro tenant. Com o fix passa. Sem a policy de
+// producao no applySchema, o teste tambem nao detectaria nada (controle da
+// propria montagem).
+func TestRLS_MasterActingAs_NaoVeOutroTenant(t *testing.T) {
+	pool, teardown := setupPostgres(t)
+	defer teardown()
+
+	root := criarTenant(t, pool, "imobo (root)", "ROOT", nil)
+	tenantA := criarTenant(t, pool, "Tenant A", "BPAAS", &root)
+	tenantB := criarTenant(t, pool, "Tenant B", "BPAAS", &root)
+
+	idA := inserirLancamento(t, pool, tenantA, uuid.New(), 1000)
+	idB := inserirLancamento(t, pool, tenantB, uuid.New(), 2000)
+
+	// Master IMOBO impersonando A: home=root != acting=A -> sem visao global.
+	tc := TenantContext{
+		ActedAsTenantID:  tenantA,
+		ActedAsUserID:    uuid.New(),
+		ActedByUserID:    uuid.New(),
+		HomeTenantID:     root,
+		VisibleTenantIDs: []uuid.UUID{tenantA},
+		IsMasterImobo:    true,
+	}
+	assert.False(t, tc.MasterVisaoGlobal(), "impersonando (acting!=home) NAO pode ter visao global")
+	ctx := Inject(context.Background(), tc)
+
+	var ids []uuid.UUID
+	err := WithTenantContext(ctx, pool, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT id FROM lancamento`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id uuid.UUID
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			ids = append(ids, id)
+		}
+		return rows.Err()
+	})
+	require.NoError(t, err)
+
+	assert.Contains(t, ids, idA, "deve ver o tenant operado (A)")
+	assert.NotContains(t, ids, idB, "VAZAMENTO: nao pode ver outro tenant (B) durante impersonacao")
+	assert.Len(t, ids, 1)
+}
+
+// TestRLS_MasterHome_VeGlobalViaBypass e o CONTROLE POSITIVO: o master no
+// PROPRIO contexto (acting_as == home) mantem a visao global cross-tenant via
+// bypass, mesmo com VisibleTenantIDs contendo so o root. Garante que o fix nao
+// matou a visao legitima do console master (ex.: tela Empresas/Tenants).
+func TestRLS_MasterHome_VeGlobalViaBypass(t *testing.T) {
+	pool, teardown := setupPostgres(t)
+	defer teardown()
+
+	root := criarTenant(t, pool, "imobo (root)", "ROOT", nil)
+	tenantA := criarTenant(t, pool, "Tenant A", "BPAAS", &root)
+	tenantB := criarTenant(t, pool, "Tenant B", "BPAAS", &root)
+
+	idRoot := inserirLancamento(t, pool, root, uuid.New(), 1)
+	idA := inserirLancamento(t, pool, tenantA, uuid.New(), 2)
+	idB := inserirLancamento(t, pool, tenantB, uuid.New(), 3)
+
+	// Master na home: acting_as == home == root -> visao global ON. A lista tem
+	// so [root], mas o bypass mostra tudo.
+	tc := TenantContext{
+		ActedAsTenantID:  root,
+		ActedAsUserID:    uuid.New(),
+		ActedByUserID:    uuid.New(),
+		HomeTenantID:     root,
+		VisibleTenantIDs: []uuid.UUID{root},
+		IsMasterImobo:    true,
+	}
+	assert.True(t, tc.MasterVisaoGlobal(), "master na home (acting==home) tem visao global")
+	ctx := Inject(context.Background(), tc)
+
+	var ids []uuid.UUID
+	err := WithTenantContext(ctx, pool, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT id FROM lancamento`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id uuid.UUID
+			_ = rows.Scan(&id)
+			ids = append(ids, id)
+		}
+		return rows.Err()
+	})
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []uuid.UUID{idRoot, idA, idB}, ids,
+		"master na home deve ver todos os tenants via bypass")
 }
 
 // TestRLS_BypassDirectoSemSetLocal_RetornaZeroRows verifica que queries fora
