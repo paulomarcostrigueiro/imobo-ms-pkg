@@ -321,6 +321,59 @@ func TestV2MalFormado(t *testing.T) {
 	}
 }
 
+// Sem a variável das anteriores, NewFromEnv tem que se comportar exatamente
+// como hoje: uma chave, formato antigo. É o que garante que atualizar a versão
+// sem mexer em configuração não muda nada.
+func TestNewFromEnv_SemAnterioresEIgualAoDeHoje(t *testing.T) {
+	t.Setenv("TESTE_ENC_KEY", key32B64(t))
+	t.Setenv("TESTE_ENC_ANTERIORES", "")
+
+	enc, err := NewFromEnv("TESTE_ENC_KEY", "TESTE_ENC_ANTERIORES")
+	if err != nil {
+		t.Fatalf("NewFromEnv: %v", err)
+	}
+	ct, err := enc.Encrypt("segredo")
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	if strings.HasPrefix(ct, "v2:") {
+		t.Fatalf("sem chaveiro configurado nao pode escrever v2, got %q", ct)
+	}
+	if got, _ := enc.Decrypt(ct); got != "segredo" {
+		t.Fatalf("roundtrip falhou: %q", got)
+	}
+}
+
+// Com a variável preenchida, a rotação liga: escreve v2 e ainda lê o que a
+// chave anterior cifrou — inclusive no formato legado.
+func TestNewFromEnv_ComAnterioresLigaRotacao(t *testing.T) {
+	velha, nova := key32B64(t), key32B64(t)
+	antigo, _ := mustNew(t, velha).Encrypt("gravado-antes") // formato legado
+
+	t.Setenv("TESTE_ENC_KEY", nova)
+	t.Setenv("TESTE_ENC_ANTERIORES", "  "+velha+" , ") // espaco e virgula sobrando
+
+	enc, err := NewFromEnv("TESTE_ENC_KEY", "TESTE_ENC_ANTERIORES")
+	if err != nil {
+		t.Fatalf("NewFromEnv: %v", err)
+	}
+	if got, err := enc.Decrypt(antigo); err != nil || got != "gravado-antes" {
+		t.Fatalf("deveria ler o que a chave anterior cifrou: got=%q err=%v", got, err)
+	}
+	ct, _ := enc.Encrypt("gravado-depois")
+	if !strings.HasPrefix(ct, "v2:") {
+		t.Fatalf("com chaveiro deveria escrever v2, got %q", ct)
+	}
+}
+
+func TestNewFromEnv_ChaveAtualAusenteFalha(t *testing.T) {
+	t.Setenv("TESTE_ENC_KEY", "")
+	t.Setenv("TESTE_ENC_ANTERIORES", "")
+	if _, err := NewFromEnv("TESTE_ENC_KEY", "TESTE_ENC_ANTERIORES"); !errors.Is(err, ErrChaveVazia) {
+		t.Fatalf("esperado ErrChaveVazia, got %v", err)
+	}
+}
+
 // keyid é derivado do MATERIAL da chave: determinístico entre processos e
 // serviços, e não revela a chave.
 func TestKeyIDEstavelENaoRevelaChave(t *testing.T) {

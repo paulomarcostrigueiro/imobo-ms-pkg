@@ -49,6 +49,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 )
 
@@ -130,6 +131,43 @@ func NewKeyring(atual string, anteriores ...string) (Encryptor, error) {
 		anel = append(anel, c)
 	}
 	return &aesGCM{anel: anel, escreveV2: true}, nil
+}
+
+// NewFromEnv monta o Encryptor lendo o chaveiro de DUAS variáveis de ambiente
+// (LEI #19 — segredo só vem de env):
+//
+//	envAtual      — a chave que cifra. Obrigatória. Ex.: "SEFAZ_ENC_KEY".
+//	envAnteriores — chaves antigas, separadas por vírgula, que só DECIFRAM.
+//	                Opcional. Ex.: "SEFAZ_ENC_KEYS_ANTERIORES".
+//
+// Vazia ou ausente a segunda, o comportamento é **idêntico ao de hoje**: uma
+// chave só, escrevendo no formato antigo. Ninguém precisa mexer em
+// configuração para o serviço continuar funcionando como sempre funcionou.
+//
+// Preenchida a segunda, a rotação liga: passa a escrever v2 com keyid, e o que
+// foi cifrado pelas anteriores continua abrindo. Ligar é, portanto, decisão
+// consciente de quem edita a configuração — não efeito de atualizar versão.
+//
+// A vírgula é o separador porque chave em base64 nunca a contém.
+func NewFromEnv(envAtual, envAnteriores string) (Encryptor, error) {
+	atual := os.Getenv(envAtual)
+	anteriores := separaChaves(os.Getenv(envAnteriores))
+	if len(anteriores) == 0 {
+		return New(atual)
+	}
+	return NewKeyring(atual, anteriores...)
+}
+
+// separaChaves quebra a lista por vírgula e descarta vazios — tolerante a
+// espaço, vírgula sobrando e valor não preenchido.
+func separaChaves(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // chave é uma entrada do chaveiro: o material de 32 bytes e o seu identificador.
