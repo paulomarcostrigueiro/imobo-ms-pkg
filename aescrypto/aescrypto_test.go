@@ -3,6 +3,8 @@
 package aescrypto
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
@@ -68,12 +70,27 @@ func TestFallbackSHA256(t *testing.T) {
 	}
 }
 
+// partesV2 separa "v2:<keyid>:<corpo>" — os testes precisam mexer no corpo sem
+// perder o cabeçalho.
+func partesV2(t *testing.T, ct string) (cabecalho, corpo string) {
+	t.Helper()
+	i := strings.LastIndexByte(ct, ':')
+	if !strings.HasPrefix(ct, "v2:") || i <= 2 {
+		t.Fatalf("esperado formato v2:<keyid>:<base64>, got %q", ct)
+	}
+	return ct[:i+1], ct[i+1:]
+}
+
 func TestTamperFalha(t *testing.T) {
 	enc := mustNew(t, key32B64(t))
 	ct, _ := enc.Encrypt("dado")
-	raw, _ := base64.StdEncoding.DecodeString(ct)
+	cab, corpo := partesV2(t, ct)
+	raw, err := base64.StdEncoding.DecodeString(corpo)
+	if err != nil {
+		t.Fatalf("corpo nao e base64: %v", err)
+	}
 	raw[len(raw)-1] ^= 0xFF // corrompe o tag GCM
-	if _, err := enc.Decrypt(base64.StdEncoding.EncodeToString(raw)); err == nil {
+	if _, err := enc.Decrypt(cab + base64.StdEncoding.EncodeToString(raw)); err == nil {
 		t.Fatal("decrypt deveria falhar em ciphertext adulterado (GCM tag)")
 	}
 }
@@ -119,5 +136,157 @@ func TestNewVazioErro(t *testing.T) {
 func TestNewChaveFracaErro(t *testing.T) {
 	if _, err := New("curta-demais"); !errors.Is(err, ErrChaveFraca) {
 		t.Fatalf("New(curta) deveria retornar ErrChaveFraca, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// CHAVEIRO / ROTAÇÃO — a razão de existir do formato v2.
+// ---------------------------------------------------------------------------
+
+// cifraLegado produz um blob no formato ANTIGO (base64 puro, sem prefixo), do
+// jeito que está gravado hoje nas 8 colunas *_encrypted em produção. É o dado
+// que a rotação NÃO pode quebrar.
+func cifraLegado(t *testing.T, chaveB64, plain string) string {
+	t.Helper()
+	raw, err := base64.StdEncoding.DecodeString(chaveB64)
+	if err != nil || len(raw) != 32 {
+		t.Fatalf("chave de teste invalida")
+	}
+	blk, err := aes.NewCipher(raw)
+	if err != nil {
+		t.Fatalf("aes: %v", err)
+	}
+	g, err := cipher.NewGCM(blk)
+	if err != nil {
+		t.Fatalf("gcm: %v", err)
+	}
+	nonce := make([]byte, g.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatalf("nonce: %v", err)
+	}
+	ct := g.Seal(nil, nonce, []byte(plain), nil)
+	return base64.StdEncoding.EncodeToString(append(nonce, ct...))
+}
+
+func TestEncryptEmiteFormatoV2(t *testing.T) {
+	enc := mustNew(t, key32B64(t))
+	ct, err := enc.Encrypt("dado")
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	if !strings.HasPrefix(ct, "v2:") {
+		t.Fatalf("Encrypt deveria emitir v2:<keyid>:..., got %q", ct)
+	}
+	id, ok := KeyIDDoBlob(ct)
+	if !ok || len(id) != 8 {
+		t.Fatalf("KeyIDDoBlob = %q,%v — esperado 8 hex", id, ok)
+	}
+	atual, ok := KeyIDAtual(enc)
+	if !ok || atual != id {
+		t.Fatalf("keyid do blob (%s) deveria ser o da chave atual (%s)", id, atual)
+	}
+}
+
+// O dado gravado ANTES do chaveiro precisa continuar abrindo. Sem isso a
+// mudança quebraria os certificados A1 de todos os clientes do fiscal.
+func TestLegadoSemPrefixoAindaDecifra(t *testing.T) {
+	k := key32B64(t)
+	legado := cifraLegado(t, k, "certificado-antigo")
+	if _, ok := KeyIDDoBlob(legado); ok {
+		t.Fatal("blob legado nao deveria ter keyid")
+	}
+	got, err := mustNew(t, k).Decrypt(legado)
+	if err != nil || got != "certificado-antigo" {
+		t.Fatalf("legado nao abriu: got=%q err=%v", got, err)
+	}
+}
+
+// O caso que motivou tudo: trocar a chave sem invalidar o que já está gravado.
+func TestRotacao_ChaveNovaLeOAntigo(t *testing.T) {
+	velha, nova := key32B64(t), key32B64(t)
+
+	antes, err := mustNew(t, velha).Encrypt("segredo-do-cliente")
+	if err != nil {
+		t.Fatalf("encrypt com a chave velha: %v", err)
+	}
+	legado := cifraLegado(t, velha, "segredo-pre-chaveiro")
+
+	// Rotação: a nova entra como atual, a velha fica só para leitura.
+	rot, err := NewKeyring(nova, velha)
+	if err != nil {
+		t.Fatalf("NewKeyring: %v", err)
+	}
+
+	if got, err := rot.Decrypt(antes); err != nil || got != "segredo-do-cliente" {
+		t.Fatalf("v2 cifrado com a chave velha deveria abrir: got=%q err=%v", got, err)
+	}
+	if got, err := rot.Decrypt(legado); err != nil || got != "segredo-pre-chaveiro" {
+		t.Fatalf("legado da chave velha deveria abrir: got=%q err=%v", got, err)
+	}
+
+	// O que for reescrito nasce com a chave NOVA — é assim que a rotação avança.
+	depois, err := rot.Encrypt("regravado")
+	if err != nil {
+		t.Fatalf("encrypt apos rotacao: %v", err)
+	}
+	idNovo, _ := KeyIDDoBlob(depois)
+	idVelho, _ := KeyIDDoBlob(antes)
+	if idNovo == idVelho {
+		t.Fatal("apos rotacao o Encrypt deveria usar a chave nova")
+	}
+	if atual, _ := KeyIDAtual(rot); atual != idNovo {
+		t.Fatalf("keyid do novo blob (%s) deveria ser o da chave atual (%s)", idNovo, atual)
+	}
+}
+
+// Tirar a chave do chaveiro antes de reescrever o que ela cifrou é o erro que
+// perde dado. O erro precisa dizer isso, não "chave errada".
+func TestChaveRemovidaCedoDemais(t *testing.T) {
+	velha, nova := key32B64(t), key32B64(t)
+	antes, _ := mustNew(t, velha).Encrypt("segredo")
+
+	so, err := NewKeyring(nova) // a velha ficou de fora
+	if err != nil {
+		t.Fatalf("NewKeyring: %v", err)
+	}
+	_, err = so.Decrypt(antes)
+	if !errors.Is(err, ErrChaveDesconhecida) {
+		t.Fatalf("esperado ErrChaveDesconhecida, got %v", err)
+	}
+}
+
+func TestChaveiroRejeitaChaveRepetida(t *testing.T) {
+	k := key32B64(t)
+	if _, err := NewKeyring(k, k); err == nil {
+		t.Fatal("chave repetida no chaveiro deveria ser rejeitada (engano de configuracao)")
+	}
+}
+
+func TestChaveiroValidaAnteriores(t *testing.T) {
+	if _, err := NewKeyring(key32B64(t), "curta"); !errors.Is(err, ErrChaveFraca) {
+		t.Fatalf("chave anterior fraca deveria ser rejeitada, got %v", err)
+	}
+}
+
+func TestV2MalFormado(t *testing.T) {
+	if _, err := mustNew(t, key32B64(t)).Decrypt("v2:semdoispontos"); !errors.Is(err, ErrFormato) {
+		t.Fatal("v2 sem o segundo ':' deveria retornar ErrFormato")
+	}
+}
+
+// keyid é derivado do MATERIAL da chave: determinístico entre processos e
+// serviços, e não revela a chave.
+func TestKeyIDEstavelENaoRevelaChave(t *testing.T) {
+	k := key32B64(t)
+	a, _ := KeyIDAtual(mustNew(t, k))
+	b, _ := KeyIDAtual(mustNew(t, k))
+	if a != b {
+		t.Fatalf("keyid deveria ser estavel para a mesma chave: %s vs %s", a, b)
+	}
+	if strings.Contains(k, a) {
+		t.Fatal("keyid nao pode ser um pedaco da chave")
+	}
+	if outro, _ := KeyIDAtual(mustNew(t, key32B64(t))); outro == a {
+		t.Fatal("chaves diferentes deveriam ter keyids diferentes")
 	}
 }
