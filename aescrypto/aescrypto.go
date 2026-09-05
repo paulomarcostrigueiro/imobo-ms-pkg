@@ -84,16 +84,30 @@ var (
 //  3. passphrase >= 32 chars → SHA-256(raw) (fallback determinístico).
 //  4. demais → ErrChaveFraca.
 //
-// Chaveiro de UMA chave: cifra em v2 e lê tanto v2 quanto legado. A assinatura
-// não mudou de propósito — nenhum serviço precisa ser tocado para ganhar o
-// formato novo.
+// ESCREVE NO FORMATO ANTIGO (base64 puro), de propósito: subir o pacote novo
+// com a mesma configuração de hoje NÃO muda um byte do que vai para o banco.
+// Isso preserva o caminho de volta — o código antigo continua conseguindo ler
+// tudo o que for gravado. Ler, o New já lê os dois formatos.
+//
+// Quem escreve v2 é o NewKeyring, e só se usa chaveiro quando se está
+// rotacionando de fato.
 func New(raw string) (Encryptor, error) {
-	return NewKeyring(raw)
+	c, err := derivaChave(raw)
+	if err != nil {
+		return nil, err
+	}
+	return &aesGCM{anel: []chave{c}, escreveV2: false}, nil
 }
 
 // NewKeyring monta o Encryptor com CHAVEIRO: `atual` cifra e decifra;
 // `anteriores` só decifram. É o que permite rotacionar sem invalidar o que já
 // está gravado — a chave nova entra como `atual` e a velha passa a `anteriores`.
+//
+// ESCREVE EM v2, porque rotação sem keyid não funciona: é o prefixo que diz
+// qual chave abre cada valor. Consequência a saber antes de usar: valor
+// gravado em v2 NÃO é legível pelo código anterior a esta versão. Rotacionar
+// é, portanto, uma decisão sem volta fácil — diferente de só subir o pacote,
+// que com New não muda nada no banco.
 //
 // Cada chave é validada pelas mesmas regras do New. Chave repetida é rejeitada:
 // keyid duplicado no chaveiro é sinal de engano de configuração, não de rotação.
@@ -115,7 +129,7 @@ func NewKeyring(atual string, anteriores ...string) (Encryptor, error) {
 		vistos[c.id] = true
 		anel = append(anel, c)
 	}
-	return &aesGCM{anel: anel}, nil
+	return &aesGCM{anel: anel, escreveV2: true}, nil
 }
 
 // chave é uma entrada do chaveiro: o material de 32 bytes e o seu identificador.
@@ -151,7 +165,13 @@ func keyID(key []byte) string {
 	return hex.EncodeToString(h[:4])
 }
 
-type aesGCM struct{ anel []chave }
+type aesGCM struct {
+	anel []chave
+	// escreveV2 decide o formato de ESCRITA. Leitura sempre aceita os dois.
+	// false (New) = formato antigo, byte-compatível com o código anterior.
+	// true (NewKeyring) = v2 com keyid, necessário para rotacionar.
+	escreveV2 bool
+}
 
 // atual é a chave que cifra: a primeira do chaveiro.
 func (e *aesGCM) atual() (chave, error) {
@@ -189,7 +209,11 @@ func (e *aesGCM) Encrypt(plain string) (string, error) {
 	out := make([]byte, 0, len(nonce)+len(ct))
 	out = append(out, nonce...)
 	out = append(out, ct...)
-	return prefixoV2 + c.id + ":" + base64.StdEncoding.EncodeToString(out), nil
+	corpo := base64.StdEncoding.EncodeToString(out)
+	if !e.escreveV2 {
+		return corpo, nil // formato antigo — o codigo anterior continua lendo
+	}
+	return prefixoV2 + c.id + ":" + corpo, nil
 }
 
 func (e *aesGCM) Decrypt(cipherB64 string) (string, error) {

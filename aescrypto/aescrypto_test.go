@@ -81,17 +81,39 @@ func partesV2(t *testing.T, ct string) (cabecalho, corpo string) {
 	return ct[:i+1], ct[i+1:]
 }
 
+func mustKeyring(t *testing.T, atual string, anteriores ...string) Encryptor {
+	t.Helper()
+	enc, err := NewKeyring(atual, anteriores...)
+	if err != nil {
+		t.Fatalf("NewKeyring: %v", err)
+	}
+	return enc
+}
+
 func TestTamperFalha(t *testing.T) {
-	enc := mustNew(t, key32B64(t))
+	enc := mustNew(t, key32B64(t)) // formato antigo: o ct e o base64 puro
+	ct, _ := enc.Encrypt("dado")
+	raw, err := base64.StdEncoding.DecodeString(ct)
+	if err != nil {
+		t.Fatalf("ct nao e base64: %v", err)
+	}
+	raw[len(raw)-1] ^= 0xFF // corrompe o tag GCM
+	if _, err := enc.Decrypt(base64.StdEncoding.EncodeToString(raw)); err == nil {
+		t.Fatal("decrypt deveria falhar em ciphertext adulterado (GCM tag)")
+	}
+}
+
+func TestTamperFalhaV2(t *testing.T) {
+	enc := mustKeyring(t, key32B64(t))
 	ct, _ := enc.Encrypt("dado")
 	cab, corpo := partesV2(t, ct)
 	raw, err := base64.StdEncoding.DecodeString(corpo)
 	if err != nil {
 		t.Fatalf("corpo nao e base64: %v", err)
 	}
-	raw[len(raw)-1] ^= 0xFF // corrompe o tag GCM
+	raw[len(raw)-1] ^= 0xFF
 	if _, err := enc.Decrypt(cab + base64.StdEncoding.EncodeToString(raw)); err == nil {
-		t.Fatal("decrypt deveria falhar em ciphertext adulterado (GCM tag)")
+		t.Fatal("decrypt deveria falhar em v2 adulterado (GCM tag)")
 	}
 }
 
@@ -168,14 +190,39 @@ func cifraLegado(t *testing.T, chaveB64, plain string) string {
 	return base64.StdEncoding.EncodeToString(append(nonce, ct...))
 }
 
+// A GARANTIA QUE PROTEGE O QUE JA ESTA NO AR: subir o pacote novo com a mesma
+// configuracao de hoje nao muda um byte do que vai para o banco, e o codigo
+// anterior continua conseguindo ler o que for gravado.
+func TestNewEscreveNoFormatoAntigo(t *testing.T) {
+	k := key32B64(t)
+	ct, err := mustNew(t, k).Encrypt("segredo")
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	if strings.HasPrefix(ct, "v2:") {
+		t.Fatalf("New NAO pode escrever v2 — quebraria o rollback. got %q", ct)
+	}
+	if _, ok := KeyIDDoBlob(ct); ok {
+		t.Fatal("blob do New nao deveria ter keyid")
+	}
+	// Prova de compatibilidade: o formato antigo e base64 puro de nonce||ct||tag.
+	raw, err := base64.StdEncoding.DecodeString(ct)
+	if err != nil {
+		t.Fatalf("formato antigo deveria ser base64 puro: %v", err)
+	}
+	if len(raw) < 12+16 {
+		t.Fatalf("blob curto demais para nonce+tag: %d bytes", len(raw))
+	}
+}
+
 func TestEncryptEmiteFormatoV2(t *testing.T) {
-	enc := mustNew(t, key32B64(t))
+	enc := mustKeyring(t, key32B64(t))
 	ct, err := enc.Encrypt("dado")
 	if err != nil {
 		t.Fatalf("encrypt: %v", err)
 	}
 	if !strings.HasPrefix(ct, "v2:") {
-		t.Fatalf("Encrypt deveria emitir v2:<keyid>:..., got %q", ct)
+		t.Fatalf("NewKeyring deveria emitir v2:<keyid>:..., got %q", ct)
 	}
 	id, ok := KeyIDDoBlob(ct)
 	if !ok || len(id) != 8 {
@@ -205,7 +252,7 @@ func TestLegadoSemPrefixoAindaDecifra(t *testing.T) {
 func TestRotacao_ChaveNovaLeOAntigo(t *testing.T) {
 	velha, nova := key32B64(t), key32B64(t)
 
-	antes, err := mustNew(t, velha).Encrypt("segredo-do-cliente")
+	antes, err := mustKeyring(t, velha).Encrypt("segredo-do-cliente") // v2 da chave velha
 	if err != nil {
 		t.Fatalf("encrypt com a chave velha: %v", err)
 	}
@@ -243,7 +290,7 @@ func TestRotacao_ChaveNovaLeOAntigo(t *testing.T) {
 // perde dado. O erro precisa dizer isso, não "chave errada".
 func TestChaveRemovidaCedoDemais(t *testing.T) {
 	velha, nova := key32B64(t), key32B64(t)
-	antes, _ := mustNew(t, velha).Encrypt("segredo")
+	antes, _ := mustKeyring(t, velha).Encrypt("segredo") // v2, com o keyid da velha
 
 	so, err := NewKeyring(nova) // a velha ficou de fora
 	if err != nil {
