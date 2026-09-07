@@ -200,3 +200,90 @@ func TestEntradasImprestaveis(t *testing.T) {
 		})
 	}
 }
+
+// TestContraDocumentosOficiaisDeVerdade roda os campos de dois CRLV-e reais,
+// assinados digitalmente pelo DETRAN, de estados e anos diferentes. E a prova de
+// que o pacote nao foi calibrado so contra a homologacao do SERPRO, que e um
+// ambiente de mock.
+func TestContraDocumentosOficiaisDeVerdade(t *testing.T) {
+	docs := []struct {
+		fonte                                        string
+		renavam, placa, chassi, numeroCRV, documento string
+		formato                                      FormatoPlaca
+	}{
+		{
+			fonte:   "CRLV-e DETRAN-SP, exercicio 2021",
+			renavam: "01183536108", placa: "EFK8I77", chassi: "99ADJ78V7K4000189",
+			numeroCRV: "213034750730", documento: "17800176000120", formato: FormatoMercosul,
+		},
+		{
+			fonte:   "CRLV-e DETRAN-MG, exercicio 2023",
+			renavam: "00852838034", placa: "HBO7C69", chassi: "9C2JD20205R016451",
+			numeroCRV: "213144245208", documento: "16725962000148", formato: FormatoMercosul,
+		},
+	}
+	for _, d := range docs {
+		t.Run(d.fonte, func(t *testing.T) {
+			if r := Renavam(d.renavam); !r.Valido || r.Valor != d.renavam {
+				t.Errorf("Renavam: %+v", r)
+			}
+			if r := Placa(d.placa); !r.Valido || FormatoDaPlaca(r.Valor) != d.formato {
+				t.Errorf("Placa: %+v", r)
+			}
+			if r := Chassi(d.chassi); !r.Valido {
+				t.Errorf("Chassi: %+v", r)
+			}
+			if r := NumeroCRV(d.numeroCRV); !r.Valido {
+				t.Errorf("NumeroCRV: %+v", r)
+			}
+			if r := CNPJ(d.documento); !r.Valido {
+				t.Errorf("CNPJ: %+v", r)
+			}
+		})
+	}
+}
+
+// TestChassi_AceitaAteVinteEUm segue o contrato do RENAVE, que pede
+// [A-HJ-NPR-Za-hj-npr-z0-9]{17,21}, e nao a amostra da homologacao, onde todos
+// tinham 17.
+func TestChassi_AceitaAteVinteEUm(t *testing.T) {
+	if r := Chassi("9BWZZZ377VT004251ABCD"); !r.Valido { // 21
+		t.Errorf("21 caracteres reprovou: %+v", r)
+	}
+	if r := Chassi("9BWZZZ377VT004251ABCDE"); r.Valido { // 22
+		t.Error("22 caracteres passou")
+	}
+}
+
+// TestCNPJ_Alfanumerico cobre o CNPJ com letra na raiz, que o contrato do RENAVE
+// ja aceita (\d{11}|[A-Za-z0-9]{12}\d{2}). O DV usa o codigo ASCII menos 48, que
+// para CNPJ so de digitos cai exatamente na conta de sempre.
+func TestCNPJ_Alfanumerico(t *testing.T) {
+	if r := CNPJ("12ABC34501DE35"); !r.Valido {
+		t.Errorf("CNPJ alfanumerico valido reprovou: %+v", r)
+	}
+	if r := CNPJ("12ABC34501DE36"); r.Valido {
+		t.Error("CNPJ alfanumerico com DV errado passou")
+	}
+	if r := CNPJ("12ABC34501DEF5"); r.Valido || r.Status != StatusCaractereInvalido {
+		t.Errorf("DV com letra tinha de reprovar: %+v", r)
+	}
+}
+
+// TestOCodigoDoCLAPassaBatido documenta a armadilha mais cara do projeto.
+//
+// O CRLV-e traz um campo "CODIGO DE SEGURANCA DO CLA" com 11 digitos, que NAO
+// serve para dar entrada no RENAVE. O valor abaixo e o do CRLV-e do DETRAN-SP
+// que usamos de amostra. Esta funcao o aprova, e esta certa em aprovar: nao ha
+// nada de errado com ele como sequencia de digitos. O erro esta em usa-lo no
+// campo do CRV, e nenhuma validacao sintatica pega isso.
+//
+// A defesa mora na modelagem, na porta ExtratorDocumento do renave-service: um
+// extrator que leu um CRLV-e nao pode preencher codigoSegurancaCrv. Este teste
+// existe para que ninguem apague aquela regra achando que a validacao aqui cobre.
+func TestOCodigoDoCLAPassaBatido(t *testing.T) {
+	const codigoDoCLA = "81626917837" // CRLV-e DETRAN-SP, campo "CODIGO DE SEGURANCA DO CLA"
+	if r := CodigoSegurancaCRV(codigoDoCLA); !r.Valido {
+		t.Fatal("o teste perdeu o sentido: era para passar, e e esse o problema")
+	}
+}

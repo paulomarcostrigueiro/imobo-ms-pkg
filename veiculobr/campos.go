@@ -25,20 +25,26 @@ const (
 // proposito, para nao confundir com 1 e 0. Se o extrator devolveu um "O", ele
 // leu um zero. A correcao e certa, nao e palpite.
 //
+// Tamanho: 17 e o padrao e foi o que veio nos 597 registros da homologacao, mas
+// o contrato do RENAVE aceita de 17 a 21 caracteres (regex
+// [A-HJ-NPR-Za-hj-npr-z0-9]{17,21} no schema de entrada de zero-km). Seguimos o
+// contrato, nao a amostra.
+//
 // NAO conferimos o digito verificador da posicao 9 (o check digit do padrao
 // norte-americano FMVSS 115). Ele NAO e obrigatorio em veiculo fabricado no
-// Brasil, e exigi-lo reprovaria chassi legitimo. Trocar falso negativo por falso
-// positivo aqui seria pior: o lojista ficaria travado com o documento certo na
-// mao.
+// Brasil, e exigi-lo reprovaria chassi legitimo. Isso nao e teoria: no CRLV-e
+// assinado pelo DETRAN-MG que usamos de amostra, o chassi 9C2JD20205R016451 tem
+// DV calculado 8 contra 0 impresso no documento. Documento valido, DV que nao
+// fecha. Bloquear por isso e travar o lojista com o documento certo na mao.
 func Chassi(s string) Resultado {
 	orig := s
 	v := limpar(s)
 	if v == "" {
 		return falha(orig, StatusVazio, "chassi nao foi lido no documento")
 	}
-	if len(v) != 17 {
+	if len(v) < 17 || len(v) > 21 {
 		return falha(orig, StatusTamanhoInvalido,
-			"chassi tem "+itoa(len(v))+" caracteres, o correto sao 17 (foto cortada ou com reflexo?)")
+			"chassi tem "+itoa(len(v))+" caracteres, o RENAVE aceita de 17 a 21 (foto cortada ou com reflexo?)")
 	}
 	var corr []Correcao
 	out := []rune(v)
@@ -187,15 +193,28 @@ func dvRenavam(base string) int {
 func NumeroCRV(s string) Resultado { return digitosFixos(s, 12, "numero do CRV") }
 
 // CodigoSegurancaCRV confere o codigo de seguranca do CRV: 11 digitos.
+// Obrigatorio na entrada, na saida e no cancelamento de estoque.
 //
-// SEM digito verificador conhecido, e este e o campo mais critico do fluxo:
-// e o segredo impresso no verso do CRV, o que ninguem digita certo e sem o qual
-// a entrada no RENAVE nao acontece. Como nao da para validar localmente, a
-// interface TEM de exibi-lo para conferencia humana antes de gravar.
+// SEM digito verificador conhecido, e este e o campo mais critico do fluxo. Ele
+// fica no CABECALHO da FRENTE do CRV papel-moeda (topo a esquerda na versao 1,
+// topo a direita na versao 2), nao no verso: o verso do CRV e o DUT, formulario
+// em branco de comprador e vendedor. Tambem aparece no ATPV-e, que e o unico
+// documento eletronico que o traz.
 //
-// CUIDADO, erro real e comum: o CRLV-e (documento de licenciamento anual) tem um
-// codigo de seguranca PROPRIO, diferente deste. Quem fotografa o CRLV achando
-// que e o CRV manda o codigo errado e a operacao e recusada.
+// A ARMADILHA MAIS CARA DO PROJETO, e ela nao e de OCR: o CRLV-e, que e o
+// documento que o cliente tem a mao, traz um campo rotulado "CODIGO DE SEGURANCA
+// DO CLA". Tambem tem 11 digitos, tambem casa com [0-9]{11}, e NAO serve para dar
+// entrada. Conferimos isso no CRLV-e do DETRAN-SP que usamos de amostra: o campo
+// impresso e "CODIGO DE SEGURANCA DO CLA", valor 81626917837, e esta funcao o
+// aprova sem pestanejar. Nenhuma validacao sintatica pega esse erro; ele so
+// aparece como recusa do SERPRO, depois de a operacao ja ter sido cobrada.
+//
+// A defesa nao mora aqui, mora na modelagem: o extrator NAO PODE preencher este
+// campo a partir de um CRLV-e, e a origem de cada campo tem de viajar junto com
+// o valor. Ver a porta ExtratorDocumento no renave-service.
+//
+// Como nao da para validar localmente, a interface TEM de exibir o campo para
+// conferencia humana antes de gravar.
 func CodigoSegurancaCRV(s string) Resultado { return digitosFixos(s, 11, "codigo de seguranca do CRV") }
 
 // CPF confere os 11 digitos e os dois digitos verificadores.
@@ -214,15 +233,29 @@ func CPF(s string) Resultado {
 	return montar(orig, v, nil)
 }
 
-// CNPJ confere os 14 digitos e os dois digitos verificadores.
+// CNPJ confere os 14 caracteres e os dois digitos verificadores.
+//
+// Aceita o CNPJ ALFANUMERICO. Isso nao e futurologia: o contrato do RENAVE ja
+// pede documentoProprietarioAtual no padrao \d{11}|[A-Za-z0-9]{12}\d{2}, ou
+// seja, a raiz pode ter letra e so os dois DV sao obrigatoriamente numericos.
+// Um validador que so aceita digito vai reprovar cliente legitimo assim que os
+// primeiros CNPJ alfanumericos entrarem em circulacao.
+//
+// No calculo do DV, cada caractere vale o codigo ASCII menos 48 (IN RFB
+// 2.229/2024): '0' vale 0, '9' vale 9, 'A' vale 17, 'B' vale 18, e assim por
+// diante. Para CNPJ so de digitos a conta cai exatamente na de sempre, que e o
+// que o teste confere contra CNPJs reais.
 func CNPJ(s string) Resultado {
 	orig := s
-	v := somenteDigitos(s)
+	v := limpar(s)
 	if v == "" {
 		return falha(orig, StatusVazio, "CNPJ nao informado")
 	}
 	if len(v) != 14 {
-		return falha(orig, StatusTamanhoInvalido, "CNPJ tem "+itoa(len(v))+" digitos, o correto sao 14")
+		return falha(orig, StatusTamanhoInvalido, "CNPJ tem "+itoa(len(v))+" caracteres, o correto sao 14")
+	}
+	if !digito(rune(v[12])) || !digito(rune(v[13])) {
+		return falha(orig, StatusCaractereInvalido, "os dois ultimos caracteres do CNPJ tem de ser numeros")
 	}
 	if todosIguais(v) || !dvCNPJ(v) {
 		return falha(orig, StatusDVInvalido, "o digito verificador do CNPJ nao fecha")
@@ -281,7 +314,7 @@ func dvCNPJ(v string) bool {
 	dv := func(pesos []int) int {
 		soma := 0
 		for i, p := range pesos {
-			soma += int(v[i]-'0') * p
+			soma += (int(v[i]) - 48) * p // ASCII-48: vale para digito e para letra
 		}
 		r := soma % 11
 		if r < 2 {
