@@ -54,6 +54,12 @@ const EnvMasterRootTenantID = "MASTER_ROOT_TENANT_ID"
 // cargo vem do JWT ASSINADO pela plataforma, logo nao e forjavel sem a chave.
 const CargoMasterImobo = "MASTER_IMOBO"
 
+// CargoAdminImobo é o cargo que opera a carteira de empresas da IMOBO
+// (LEI-MS #30, exceção 2). Só tem efeito com home no master-root e sem
+// acting-as (ver EhAdminImobo). Não é master: não promove IsMasterImobo nem dá
+// visão global no RLS.
+const CargoAdminImobo = "ADMIN_IMOBO"
+
 // masterRootTenantID le e parseia EnvMasterRootTenantID. Retorna (id, true)
 // SOMENTE quando a env contiver um UUID valido e NAO-nil. Em qualquer outra
 // situacao (ausente, vazia, invalida, nil-uuid) retorna (uuid.Nil, false) —
@@ -249,6 +255,25 @@ func (tc TenantContext) VisibleTenantIDsSQL() string {
 // pre-auth deles depende disso e NAO e quebrado por esta regra.
 func (tc TenantContext) MasterVisaoGlobal() bool {
 	return tc.IsMasterImobo && tc.ActedAsTenantID == tc.HomeTenantID
+}
+
+// EhAdminImobo indica se a sessão é de um ADMIN_IMOBO válido: cargo assinado
+// ADMIN_IMOBO, home no master-root configurado por env e operando o próprio
+// home (sem acting-as). Com a env ausente, inválida ou nil-uuid,
+// IsMasterRootTenant devolve false e a resposta é false (fail-closed).
+func (tc TenantContext) EhAdminImobo() bool {
+	return tc.Cargo == CargoAdminImobo &&
+		IsMasterRootTenant(tc.HomeTenantID) &&
+		tc.ActedAsTenantID == tc.HomeTenantID
+}
+
+// PodeOperarCarteiraImobo é a PERMISSÃO de operar a carteira de empresas da
+// IMOBO (Empresas, Credenciamento, Atendimentos, Remetentes e o cadastro de
+// revenda): master IMOBO ou ADMIN_IMOBO. Não é visibilidade. Não altera
+// MasterVisaoGlobal nem o GUC app.is_master_imobo; a leitura cross-tenant da
+// carteira continua montada só no handler dela.
+func (tc TenantContext) PodeOperarCarteiraImobo() bool {
+	return tc.IsMasterImobo || tc.EhAdminImobo()
 }
 
 // HasServico retorna true se o servico `nome` estiver na lista de servicos
