@@ -5,9 +5,14 @@ package iauso
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -54,9 +59,27 @@ type Registro struct {
 	// cache1h e a parte de TokensCacheEscrita com cache de 1 hora (custa 2x,
 	// contra 1,25x do de 5 min). So entra na conta do custo; nao e gravado.
 	cache1h int
+	// estimado: resposta 200 sem usage; tokens estimados por cima (custo pelo
+	// modelo mais caro, PrecoConhecido = false).
+	estimado bool
 }
 
+// ErrRegistrosInvalidos: o banco recusou esses registros pelo CONTEUDO (valor
+// fora do formato), nao por estar fora do ar. Repetir nao adianta: a Fila os
+// escreve no log e segue com o resto, que ja foi gravado.
+type ErrRegistrosInvalidos struct {
+	Indices []int
+	Causa   error
+}
+
+func (e *ErrRegistrosInvalidos) Error() string {
+	return fmt.Sprintf("iauso: %d registro(s) invalido(s): %v", len(e.Indices), e.Causa)
+}
+
+func (e *ErrRegistrosInvalidos) Unwrap() error { return e.Causa }
+
 // Gravador persiste registros e soma o gasto. PostgresGravador e o real.
+// Gravar devolve *ErrRegistrosInvalidos quando so alguns registros sao ruins.
 type Gravador interface {
 	Gravar(ctx context.Context, rs []Registro) error
 	GastoDesde(ctx context.Context, organizacao string, desde time.Time) (claudeia.MicroDolar, error)
@@ -77,9 +100,10 @@ type Fila struct {
 	lote         int
 	intervalo    time.Duration
 
-	fechar chan struct{}
-	wg     sync.WaitGroup
-	once   sync.Once
+	fechar  chan struct{}
+	fechada atomic.Bool
+	wg      sync.WaitGroup
+	once    sync.Once
 }
 
 // NovaFila cria e INICIA a fila. Chame Fechar no shutdown.
@@ -100,8 +124,13 @@ func NovaFila(g Gravador, log *slog.Logger) *Fila {
 	return f
 }
 
-// Enviar entrega um registro sem bloquear. Fila cheia = log e segue.
+// Enviar entrega um registro sem bloquear. Fila cheia ou ja fechada = log e
+// segue.
 func (f *Fila) Enviar(r Registro) {
+	if f.fechada.Load() {
+		f.descartar(r, "fila ja encerrada")
+		return
+	}
 	select {
 	case f.ch <- r:
 	default:
@@ -110,8 +139,10 @@ func (f *Fila) Enviar(r Registro) {
 }
 
 // Fechar grava o que der ate ctx vencer; o resto vai para o log.
+//
+// Use um ctx PROPRIO (nao o do Shutdown do HTTP, que pode ja ter vencido).
 func (f *Fila) Fechar(ctx context.Context) {
-	f.once.Do(func() { close(f.fechar) })
+	f.once.Do(func() { f.fechada.Store(true); close(f.fechar) })
 	done := make(chan struct{})
 	go func() { f.wg.Wait(); close(done) }()
 	select {
@@ -123,6 +154,7 @@ func (f *Fila) Fechar(ctx context.Context) {
 func (f *Fila) rodar() {
 	defer f.wg.Done()
 	var pend []Registro
+	novos := 0 // chegados desde a ultima tentativa
 	espera := f.intervalo
 	t := time.NewTimer(espera)
 	defer t.Stop()
@@ -130,7 +162,10 @@ func (f *Fila) rodar() {
 		select {
 		case r := <-f.ch:
 			pend = append(pend, r)
-			if len(pend) < f.lote {
+			novos++
+			// Lote cheio grava na hora, MAS nao durante o backoff (banco fora):
+			// ai so o timer tenta, para nao martelar o banco a cada registro.
+			if novos < f.lote || espera > f.intervalo {
 				continue
 			}
 		case <-t.C:
@@ -156,6 +191,7 @@ func (f *Fila) rodar() {
 			}
 			return
 		}
+		novos = 0
 		antes := len(pend)
 		pend = f.gravar(pend)
 		if len(pend) > 0 && len(pend) == antes {
@@ -186,6 +222,16 @@ func (f *Fila) gravar(pend []Registro) []Registro {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		err := f.g.Gravar(ctx, pend[:n])
 		cancel()
+		var inv *ErrRegistrosInvalidos
+		if errors.As(err, &inv) {
+			for _, i := range inv.Indices {
+				if i >= 0 && i < n {
+					f.descartar(pend[i], "recusado pelo banco: "+inv.Causa.Error())
+				}
+			}
+			pend = pend[n:]
+			continue
+		}
 		if err != nil {
 			f.log.Warn("iauso: banco indisponivel; registros pendentes", "pendentes", len(pend), "erro", err)
 			return pend
@@ -198,4 +244,38 @@ func (f *Fila) gravar(pend []Registro) []Registro {
 func (f *Fila) descartar(r Registro, motivo string) {
 	b, _ := json.Marshal(r)
 	f.log.Error("iauso: registro descartado", "motivo", motivo, "registro", string(b))
+}
+
+// sanear corta cada texto ao tamanho da coluna, tira \x00 (o jsonb recusa) e
+// zera numeros negativos. Um registro estranho nunca pode travar a fila.
+func sanear(r Registro) Registro {
+	r.Servico = cortar(r.Servico, 40)
+	r.Funcionalidade = cortar(r.Funcionalidade, 60)
+	r.Organizacao = cortar(r.Organizacao, 40)
+	r.Modelo = cortar(r.Modelo, 80)
+	r.RequestID = cortar(r.RequestID, 120)
+	r.ConversaID = cortar(r.ConversaID, 80)
+	for _, p := range []*int{&r.TokensEntrada, &r.TokensSaida, &r.TokensCacheEscrita, &r.TokensCacheLeitura, &r.HTTPStatus} {
+		if *p < 0 {
+			*p = 0
+		}
+	}
+	if r.Custo < 0 {
+		r.Custo = 0
+	}
+	if r.DuracaoMS < 0 {
+		r.DuracaoMS = 0
+	}
+	return r
+}
+
+func cortar(s string, max int) string {
+	if !utf8.ValidString(s) {
+		s = strings.ToValidUTF8(s, "")
+	}
+	s = strings.ReplaceAll(s, "\x00", "")
+	if utf8.RuneCountInString(s) <= max {
+		return s
+	}
+	return string([]rune(s)[:max])
 }

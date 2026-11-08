@@ -36,6 +36,7 @@ const (
 	EnvOrganizacao      = "IMOBO_IA_ORGANIZACAO"        // organizacao da chave do servico: A, B...
 	EnvLimites          = "IMOBO_IA_LIMITES"            // ver ParseLimites
 	EnvConexaoMS        = "IMOBO_IA_SERVICE_CONEXAO_MS" // tempo para CONECTAR no ia-service antes do plano B
+	EnvImpressoes       = "IMOBO_IA_IMPRESSOES"         // so no ia-service: organizacao pela chave (ver ParseImpressoes)
 )
 
 // Config e a configuracao de um servico.

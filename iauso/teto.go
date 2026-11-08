@@ -101,11 +101,13 @@ type Teto struct {
 	avisador Avisador
 	log      *slog.Logger
 
-	validade time.Duration
-	agora    func() time.Time
+	validade      time.Duration
+	tempoConsulta time.Duration
+	agora         func() time.Time
 
 	mu       sync.Mutex
 	cache    map[string]gastoCache
+	lendo    map[string]bool
 	avisados map[string]bool
 }
 
@@ -119,10 +121,12 @@ func NovoTeto(limites FonteLimites, gasto Gravador, avisador Avisador, log *slog
 	}
 	return &Teto{
 		limites: limites, gasto: gasto, avisador: avisador, log: log,
-		validade: 30 * time.Second,
-		agora:    time.Now,
-		cache:    map[string]gastoCache{},
-		avisados: map[string]bool{},
+		validade:      30 * time.Second,
+		tempoConsulta: 500 * time.Millisecond,
+		agora:         time.Now,
+		cache:         map[string]gastoCache{},
+		lendo:         map[string]bool{},
+		avisados:      map[string]bool{},
 	}
 }
 
@@ -142,20 +146,42 @@ func (t *Teto) Verificar(ctx context.Context, org string) Situacao {
 
 	t.mu.Lock()
 	c, tem := t.cache[org]
+	temCiclo := tem && c.ciclo.Equal(ciclo)
+	ler := (!temCiclo || agora.Sub(c.lidoEm) >= t.validade) && !t.lendo[org]
+	if ler {
+		t.lendo[org] = true // uma leitura por organizacao; as outras usam o cache
+	}
 	t.mu.Unlock()
-	if !tem || !c.ciclo.Equal(ciclo) || agora.Sub(c.lidoEm) >= t.validade {
-		g, err := t.gasto.GastoDesde(ctx, org, ciclo)
-		if err != nil {
-			t.log.Warn("iauso: gasto indisponivel; usando o ultimo lido", "organizacao", org, "erro", err)
-			if !tem || !c.ciclo.Equal(ciclo) {
-				return s // sem dado nenhum do ciclo: nao bloqueia
-			}
-		} else {
-			c = gastoCache{ciclo: ciclo, gasto: g, lidoEm: agora}
-			t.mu.Lock()
-			t.cache[org] = c
-			t.mu.Unlock()
+
+	if ler {
+		// Tempo curto: banco pendurado nao pode segurar a chamada da IA.
+		qctx, cancel := context.WithTimeout(ctx, t.tempoConsulta)
+		g, err := t.gasto.GastoDesde(qctx, org, ciclo)
+		cancel()
+		t.mu.Lock()
+		delete(t.lendo, org)
+		atual, temAtual := t.cache[org]
+		mesmoCiclo := temAtual && atual.ciclo.Equal(ciclo)
+		novo := gastoCache{ciclo: ciclo, lidoEm: agora}
+		if mesmoCiclo {
+			novo.gasto = atual.gasto
 		}
+		if err != nil {
+			// Guarda a tentativa (lidoEm) para nao reconsultar a cada chamada.
+			// Sem leitura anterior, o gasto fica so com o somado em memoria: um
+			// piso, que ainda pode bloquear.
+			t.log.Warn("iauso: gasto indisponivel; usando o ultimo valor conhecido", "organizacao", org, "erro", err)
+		} else if g > novo.gasto {
+			// max(banco, memoria): o que ainda esta na fila (nao gravado) nao
+			// some na releitura; o que outros processos gravaram entra.
+			novo.gasto = g
+		}
+		t.cache[org] = novo
+		t.mu.Unlock()
+		c, tem, temCiclo = novo, true, true
+	}
+	if !tem || !temCiclo {
+		return s // outra leitura em andamento e nada do ciclo ainda: nao bloqueia
 	}
 	s.Gasto = c.gasto
 	s.Bloqueado = lim.Total() > 0 && s.Gasto >= lim.Total()
@@ -207,7 +233,10 @@ func (t *Teto) talvezAvisar(ctx context.Context, org string, s Situacao) {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
 		if err := t.avisador.Avisar(ctx, av); err != nil {
-			t.log.Error("iauso: aviso de teto falhou", "organizacao", org, "nivel", int(nivel), "erro", err)
+			t.log.Error("iauso: aviso de teto falhou; tenta de novo na proxima chamada", "organizacao", org, "nivel", int(nivel), "erro", err)
+			t.mu.Lock()
+			delete(t.avisados, chave)
+			t.mu.Unlock()
 		}
 	}()
 }

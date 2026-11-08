@@ -24,6 +24,39 @@ import (
 type Proxy struct {
 	rp  *httputil.ReverseProxy
 	log *slog.Logger
+	// impressoes liga o sha256 de cada chave da IMOBO a organizacao. Com ela
+	// preenchida, a organizacao vem da CHAVE e o cabecalho X-Imobo-Organizacao
+	// e ignorado: quem esta na rede interna nao fura o teto mandando outro
+	// valor. Chave fora do mapa = chave_tenant.
+	impressoes map[string]string
+}
+
+// ParseImpressoes le IMOBO_IA_IMPRESSOES: "A:<sha256 hex da chave>,B:<...>".
+// O sha256 nao e segredo. Para calcular: printf %s "$CHAVE" | sha256sum
+func ParseImpressoes(s string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, item := range strings.Split(strings.TrimSpace(s), ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		org, imp, ok := strings.Cut(item, ":")
+		org, imp = strings.TrimSpace(org), strings.ToLower(strings.TrimSpace(imp))
+		if !ok || org == "" || org == OrganizacaoChaveTenant || len(imp) != 64 || strings.Trim(imp, "0123456789abcdef") != "" {
+			return nil, fmt.Errorf("iauso: impressao %q: use organizacao:<sha256 hex>", item)
+		}
+		if _, dup := out[imp]; dup {
+			return nil, fmt.Errorf("iauso: impressao repetida em %s", EnvImpressoes)
+		}
+		out[imp] = org
+	}
+	return out, nil
+}
+
+// ComImpressoes liga a identificacao da organizacao pela chave. Ver Proxy.
+func (p *Proxy) ComImpressoes(m map[string]string) *Proxy {
+	p.impressoes = m
+	return p
 }
 
 // NovoProxy monta o proxy. upstream vazio = https://api.anthropic.com.
@@ -48,6 +81,7 @@ func NovoProxy(upstream string, t *Transporte, log *slog.Logger) (*Proxy, error)
 			pr.SetURL(u)
 			pr.Out.Host = u.Host
 			removerCabecalhosImobo(pr.Out.Header)
+			pr.Out.Header.Del("Accept-Encoding")
 		},
 		Transport: t,
 		ModifyResponse: func(resp *http.Response) error {
@@ -83,6 +117,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ConversaID:     strings.TrimSpace(r.Header.Get(HeaderConversa)),
 		Modo:           ModoMicrosservico,
 	}
+	if len(p.impressoes) > 0 {
+		if org, ok := p.impressoes[impressao(r.Header.Get("x-api-key"))]; ok {
+			o.Organizacao = org
+		} else {
+			o.Organizacao = OrganizacaoChaveTenant
+		}
+	}
 	if id, err := uuid.Parse(strings.TrimSpace(r.Header.Get(HeaderTenant))); err == nil && id != uuid.Nil {
 		o.TenantID = &id
 	}
@@ -91,7 +132,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func cabecalho(r *http.Request, nome, padrao string) string {
 	v := strings.TrimSpace(r.Header.Get(nome))
-	if v == "" || len(v) > 60 {
+	if v == "" || len(v) > 40 {
 		return padrao
 	}
 	return v

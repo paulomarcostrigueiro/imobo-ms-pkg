@@ -113,4 +113,18 @@ func TestPostgresTabelaRLSEGasto(t *testing.T) {
 	var total int
 	require.NoError(t, admin.QueryRow(ctx, `SELECT count(*) FROM svc.ia_uso`).Scan(&total))
 	assert.Equal(t, 4, total, "o reenvio nao duplicou")
+
+	// Um registro ruim no meio do lote (status fora do CHECK): so ele e
+	// recusado; os outros dois entram.
+	lote := []Registro{
+		{ID: uuid.New(), CriadoEm: agora, Servico: "s", Funcionalidade: "f", Organizacao: "A", Modo: ModoBiblioteca, Status: StatusOK},
+		{ID: uuid.New(), CriadoEm: agora, Servico: "s", Funcionalidade: "f", Organizacao: "A", Modo: ModoBiblioteca, Status: "invalido"},
+		{ID: uuid.New(), CriadoEm: agora, Servico: strings.Repeat("x", 300), Funcionalidade: "f", Organizacao: "A", Modo: ModoBiblioteca, Status: StatusOK},
+	}
+	err = g.Gravar(ctx, lote)
+	var inv *ErrRegistrosInvalidos
+	require.ErrorAs(t, err, &inv)
+	assert.Equal(t, []int{1}, inv.Indices, "o texto longo e cortado; so o status invalido e recusado")
+	require.NoError(t, admin.QueryRow(ctx, `SELECT count(*) FROM svc.ia_uso`).Scan(&total))
+	assert.Equal(t, 6, total)
 }

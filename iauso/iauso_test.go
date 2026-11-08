@@ -107,7 +107,7 @@ const respostaOK = `{"id":"msg_1","model":"claude-sonnet-4-6","content":[{"type"
 "usage":{"input_tokens":1000,"output_tokens":200,"cache_creation_input_tokens":400,"cache_read_input_tokens":3000,
 "cache_creation":{"ephemeral_5m_input_tokens":300,"ephemeral_1h_input_tokens":100}}}`
 
-func pedido(t *testing.T, ctx context.Context, base, chave string) *http.Request {
+func novoPedido(t *testing.T, ctx context.Context, base, chave string) *http.Request {
 	t.Helper()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/v1/messages",
 		strings.NewReader(`{"model":"claude-sonnet-4-6","max_tokens":10,"messages":[{"role":"user","content":"segredo do cliente"}]}`))
@@ -223,7 +223,7 @@ func TestBibliotecaRegistraEDevolveCorpo(t *testing.T) {
 	tenant := uuid.New()
 	ctx := tenantctx.Inject(context.Background(), tenantctx.TenantContext{ActedAsTenantID: tenant})
 	ctx = ComFuncionalidade(ctx, "importacao_colunas")
-	resp, err := tr.Cliente(5 * time.Second).Do(pedido(t, ctx, api.srv.URL, chaveA))
+	resp, err := tr.Cliente(5 * time.Second).Do(novoPedido(t, ctx, api.srv.URL, chaveA))
 	require.NoError(t, err)
 	b, _ := io.ReadAll(resp.Body)
 	assert.JSONEq(t, respostaOK, string(b), "quem chama le o corpo intacto")
@@ -254,7 +254,7 @@ func TestChaveDoTenantNaoContaNoTeto(t *testing.T) {
 	teto := NovoTeto(LimitesFixos{"B": {Credito: 1, Teto: 1, DiaRenovacao: 1}}, g, &memAvisador{}, nil)
 	tr, _ := NovoTransporte(cfgBiblioteca(), nil, f, teto, nil)
 
-	resp, err := tr.Cliente(5 * time.Second).Do(pedido(t, context.Background(), api.srv.URL, "sk-ant-chave-do-tenant"))
+	resp, err := tr.Cliente(5 * time.Second).Do(novoPedido(t, context.Background(), api.srv.URL, "sk-ant-chave-do-tenant"))
 	require.NoError(t, err)
 	assert.Equal(t, 200, resp.StatusCode, "chave do tenant nunca bloqueia")
 	fechar(t, f)
@@ -271,7 +271,7 @@ func TestTetoAtingidoNaoChamaAnthropic(t *testing.T) {
 	teto := NovoTeto(LimitesFixos{"B": {Credito: 200_000_000, Teto: 50_000_000, DiaRenovacao: 1}}, g, av, nil)
 	tr, _ := NovoTransporte(cfgBiblioteca(), nil, f, teto, nil)
 
-	resp, err := tr.Cliente(5 * time.Second).Do(pedido(t, context.Background(), api.srv.URL, chaveA))
+	resp, err := tr.Cliente(5 * time.Second).Do(novoPedido(t, context.Background(), api.srv.URL, chaveA))
 	require.NoError(t, err)
 	b, _ := io.ReadAll(resp.Body)
 	assert.Equal(t, StatusTeto, resp.StatusCode)
@@ -316,7 +316,7 @@ func TestBancoForaDoArNaoParaAIA(t *testing.T) {
 	teto := NovoTeto(LimitesFixos{"B": {Credito: 1, Teto: 1, DiaRenovacao: 1}}, g, nil, nil)
 	tr, _ := NovoTransporte(cfgBiblioteca(), nil, f, teto, nil)
 
-	resp, err := tr.Cliente(5 * time.Second).Do(pedido(t, context.Background(), api.srv.URL, chaveA))
+	resp, err := tr.Cliente(5 * time.Second).Do(novoPedido(t, context.Background(), api.srv.URL, chaveA))
 	require.NoError(t, err)
 	assert.Equal(t, 200, resp.StatusCode, "sem gasto lido, nao bloqueia")
 	fechar(t, f)
@@ -328,7 +328,7 @@ func TestSemCredito(t *testing.T) {
 	g := &memGravador{}
 	f := NovaFila(g, nil)
 	tr, _ := NovoTransporte(cfgBiblioteca(), nil, f, nil, nil)
-	resp, err := tr.Cliente(5 * time.Second).Do(pedido(t, context.Background(), api.srv.URL, chaveA))
+	resp, err := tr.Cliente(5 * time.Second).Do(novoPedido(t, context.Background(), api.srv.URL, chaveA))
 	require.NoError(t, err)
 	assert.Equal(t, 400, resp.StatusCode, "o servico ve o erro original")
 	fechar(t, f)
@@ -350,7 +350,7 @@ func TestStreamSSE(t *testing.T) {
 	g := &memGravador{}
 	f := NovaFila(g, nil)
 	tr, _ := NovoTransporte(cfgBiblioteca(), nil, f, nil, nil)
-	resp, err := tr.Cliente(5 * time.Second).Do(pedido(t, context.Background(), srv.URL, chaveA))
+	resp, err := tr.Cliente(5 * time.Second).Do(novoPedido(t, context.Background(), srv.URL, chaveA))
 	require.NoError(t, err)
 	b, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
@@ -376,7 +376,7 @@ func TestOutrasRotasEModoDesligadoPassamDireto(t *testing.T) {
 	cfg := cfgBiblioteca()
 	cfg.Modo = ModoDesligado
 	des, _ := NovoTransporte(cfg, nil, f, nil, nil)
-	_, err = des.Cliente(5 * time.Second).Do(pedido(t, context.Background(), api.srv.URL, chaveA))
+	_, err = des.Cliente(5 * time.Second).Do(novoPedido(t, context.Background(), api.srv.URL, chaveA))
 	require.NoError(t, err)
 	fechar(t, f)
 	assert.Empty(t, g.registros())
@@ -413,7 +413,7 @@ func TestMicrosservicoRegistraNoIaService(t *testing.T) {
 	tenant := uuid.New()
 	ctx := ComConversa(ComTenant(ComFuncionalidade(context.Background(), "assistente_coletor"), tenant), "conv-9")
 	// o servico chama o endereco da Anthropic; o transporte desvia para o ia-service
-	resp, err := tr.Cliente(5 * time.Second).Do(pedido(t, ctx, "https://api.anthropic.com", chaveA))
+	resp, err := tr.Cliente(5 * time.Second).Do(novoPedido(t, ctx, "https://api.anthropic.com", chaveA))
 	require.NoError(t, err)
 	b, _ := io.ReadAll(resp.Body)
 	assert.JSONEq(t, respostaOK, string(b))
@@ -448,7 +448,7 @@ func TestMicrosservicoAplicaOTeto(t *testing.T) {
 	cfg := cfgBiblioteca()
 	cfg.Modo, cfg.URLMicrosservico = ModoMicrosservico, ms.URL
 	tr, _ := NovoTransporte(cfg, nil, nil, nil, nil)
-	resp, err := tr.Cliente(5 * time.Second).Do(pedido(t, context.Background(), "https://api.anthropic.com", chaveA))
+	resp, err := tr.Cliente(5 * time.Second).Do(novoPedido(t, context.Background(), "https://api.anthropic.com", chaveA))
 	require.NoError(t, err)
 	b, _ := io.ReadAll(resp.Body)
 	assert.True(t, EhTetoAtingido(resp.StatusCode, b), "mesma resposta de teto nos dois modos")
@@ -467,7 +467,7 @@ func TestPlanoBQuandoIaServiceNaoConecta(t *testing.T) {
 	cfg := cfgBiblioteca()
 	cfg.Modo, cfg.URLMicrosservico = ModoMicrosservico, morto
 	tr, _ := NovoTransporte(cfg, nil, f, nil, nil)
-	resp, err := tr.Cliente(5 * time.Second).Do(pedido(t, context.Background(), api.srv.URL, chaveA))
+	resp, err := tr.Cliente(5 * time.Second).Do(novoPedido(t, context.Background(), api.srv.URL, chaveA))
 	require.NoError(t, err)
 	assert.Equal(t, 200, resp.StatusCode)
 	fechar(t, f)
@@ -498,7 +498,7 @@ func TestSemPlanoBQuandoConectouECaiu(t *testing.T) {
 	cfg := cfgBiblioteca()
 	cfg.Modo, cfg.URLMicrosservico = ModoMicrosservico, fmt.Sprintf("http://%s", l.Addr())
 	tr, _ := NovoTransporte(cfg, nil, nil, nil, nil)
-	_, err = tr.Cliente(5 * time.Second).Do(pedido(t, context.Background(), api.srv.URL, chaveA))
+	_, err = tr.Cliente(5 * time.Second).Do(novoPedido(t, context.Background(), api.srv.URL, chaveA))
 	assert.Error(t, err)
 	assert.Zero(t, api.chamadas.Load(), "nao repete direto: poderia cobrar duas vezes")
 }

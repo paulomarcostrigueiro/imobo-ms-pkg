@@ -5,6 +5,7 @@ package iauso
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -67,6 +68,12 @@ func NovoTransporte(cfg Config, base http.RoundTripper, fila *Fila, teto *Teto, 
 	}
 	ms := http.DefaultTransport.(*http.Transport).Clone()
 	ms.DialContext = (&net.Dialer{Timeout: cfg.TempoConexaoMicrosservico, KeepAlive: 30 * time.Second}).DialContext
+	// Sem HTTP_PROXY ate o ia-service: com proxy no meio, ia-service fora vira
+	// 502 do proxy (conectou) e o plano B nunca dispara.
+	ms.Proxy = nil
+	if strings.TrimSpace(cfg.ChaveServico) != "" && cfg.Organizacao == "" {
+		log.Error("iauso: servico com chave e sem " + EnvOrganizacao + "; uso gravado como nao_configurada e SEM teto")
+	}
 	return &Transporte{
 		cfg: cfg, direto: base, ms: ms, fila: fila, teto: teto, log: log,
 		chaveServico: impressao(cfg.ChaveServico),
@@ -97,7 +104,8 @@ func (t *Transporte) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	o := t.origemDa(req)
-	modelo := modeloPedido(corpo)
+	ped := lerPedido(corpo)
+	modelo := ped.Modelo
 
 	if t.cfg.Modo == ModoMicrosservico && o.Modo == "" {
 		resp, err := t.viaMicrosservico(req, corpo, o)
@@ -106,7 +114,7 @@ func (t *Transporte) RoundTrip(req *http.Request) (*http.Response, error) {
 				return resp, nil
 			}
 			o.Modo = ModoMicrosservico
-			return t.medir(resp, o, modelo, inicio), nil
+			return t.medir(resp, o, ped, inicio), nil
 		}
 		if !ehFalhaDeConexao(err) || req.Context().Err() != nil {
 			// Conectou e falhou depois: o pedido pode ja ter ido a Anthropic.
@@ -129,13 +137,17 @@ func (t *Transporte) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	r2 := req.Clone(req.Context())
 	removerCabecalhosImobo(r2.Header)
+	// Sem Accept-Encoding explicito, o http.Transport pede gzip e descomprime
+	// sozinho; com ele (ex.: repassado pelo proxy), entregaria bytes gzip e o
+	// usage nao seria lido (custo 0, teto cego).
+	r2.Header.Del("Accept-Encoding")
 	porCorpo(r2, corpo)
 	resp, err := t.direto.RoundTrip(r2)
 	if err != nil {
 		t.registrar(req.Context(), o, Registro{Modelo: modelo, Status: StatusFalhaRede}, inicio)
 		return nil, err
 	}
-	return t.medir(resp, o, modelo, inicio), nil
+	return t.medir(resp, o, ped, inicio), nil
 }
 
 // origemDa monta a origem: do ctx quando vem do Proxy, senao da Config.
@@ -171,6 +183,7 @@ func (t *Transporte) viaMicrosservico(req *http.Request, corpo []byte, o origem)
 	u.Path = strings.TrimRight(alvo.URL.Path, "/") + req.URL.Path
 	r2.URL, r2.Host = &u, ""
 	removerCabecalhosImobo(r2.Header)
+	r2.Header.Del("Accept-Encoding")
 	r2.Header.Set(HeaderServico, o.Servico)
 	r2.Header.Set(HeaderFuncionalidade, o.Funcionalidade)
 	r2.Header.Set(HeaderOrganizacao, o.Organizacao)
@@ -184,8 +197,37 @@ func (t *Transporte) viaMicrosservico(req *http.Request, corpo []byte, o origem)
 	return t.ms.RoundTrip(r2)
 }
 
+// pedido e o que se le do corpo do pedido para registrar e estimar.
+type pedido struct {
+	Modelo    string
+	MaxTokens int
+	Bytes     int
+}
+
+func lerPedido(corpo []byte) pedido {
+	var v struct {
+		Model     string `json:"model"`
+		MaxTokens int    `json:"max_tokens"`
+	}
+	_ = json.Unmarshal(corpo, &v)
+	return pedido{Modelo: v.Model, MaxTokens: v.MaxTokens, Bytes: len(corpo)}
+}
+
+// estimar preenche tokens por cima quando uma resposta 200 nao trouxe usage
+// legivel: entrada = bytes do pedido / 3, saida = max_tokens, preco do mais caro.
+// Melhor cobrar a mais do que deixar o teto cego.
+func (t *Transporte) estimar(r *Registro, ped pedido) {
+	if r.Status != StatusOK || r.TokensEntrada+r.TokensSaida+r.TokensCacheEscrita+r.TokensCacheLeitura > 0 {
+		return
+	}
+	r.TokensEntrada = ped.Bytes/3 + 1
+	r.TokensSaida = ped.MaxTokens
+	r.estimado = true
+	t.log.Error("iauso: resposta 200 sem usage legivel; custo ESTIMADO por cima", "modelo", r.Modelo)
+}
+
 // medir le o usage da resposta (sem atrapalhar quem le o corpo depois) e grava.
-func (t *Transporte) medir(resp *http.Response, o origem, modelo string, inicio time.Time) *http.Response {
+func (t *Transporte) medir(resp *http.Response, o origem, ped pedido, inicio time.Time) *http.Response {
 	ctx := context.Background()
 	if resp.Request != nil {
 		ctx = resp.Request.Context()
@@ -193,13 +235,17 @@ func (t *Transporte) medir(resp *http.Response, o origem, modelo string, inicio 
 	if strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
 		resp.Body = &leitorSSE{
 			orig: resp.Body,
-			fim: func(b []byte) {
-				r := lerSSE(b)
+			fim: func(b []byte, errLeitura error) {
+				r := lerSSE(descomprimir(resp.Header, b))
 				r.HTTPStatus = resp.StatusCode
 				r.RequestID = primeiro(resp.Header.Get("request-id"), r.RequestID)
 				if r.Modelo == "" {
-					r.Modelo = modelo
+					r.Modelo = ped.Modelo
 				}
+				if errLeitura != nil && r.Status == StatusOK {
+					r.Status = StatusFalhaRede // stream cortado: tokens parciais
+				}
+				t.estimar(&r, ped)
 				t.registrar(ctx, o, r, inicio)
 			},
 		}
@@ -209,16 +255,35 @@ func (t *Transporte) medir(resp *http.Response, o origem, modelo string, inicio 
 	_ = resp.Body.Close()
 	resp.Body = io.NopCloser(bytes.NewReader(b))
 	if err != nil {
-		t.registrar(ctx, o, Registro{Modelo: modelo, Status: StatusFalhaRede, HTTPStatus: resp.StatusCode}, inicio)
+		t.registrar(ctx, o, Registro{Modelo: ped.Modelo, Status: StatusFalhaRede, HTTPStatus: resp.StatusCode}, inicio)
 		return resp
 	}
-	r := lerResposta(resp.StatusCode, b)
+	r := lerResposta(resp.StatusCode, descomprimir(resp.Header, b))
 	r.RequestID = primeiro(resp.Header.Get("request-id"), r.RequestID)
 	if r.Modelo == "" {
-		r.Modelo = modelo
+		r.Modelo = ped.Modelo
 	}
+	t.estimar(&r, ped)
 	t.registrar(ctx, o, r, inicio)
 	return resp
+}
+
+// descomprimir devolve o corpo legivel para a MEDICAO (o corpo entregue a quem
+// chamou nao muda). So gzip; outro encoding volta como veio.
+func descomprimir(h http.Header, b []byte) []byte {
+	if !strings.EqualFold(strings.TrimSpace(h.Get("Content-Encoding")), "gzip") {
+		return b
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(b))
+	if err != nil {
+		return b
+	}
+	defer zr.Close()
+	out, err := io.ReadAll(io.LimitReader(zr, 64<<20))
+	if err != nil {
+		return b
+	}
+	return out
 }
 
 // registrar completa e envia o registro. r traz modelo, tokens e status.
@@ -235,12 +300,15 @@ func (t *Transporte) registrar(ctx context.Context, o origem, r Registro, inicio
 	r.DuracaoMS = agora.Sub(inicio).Milliseconds()
 	if r.Status == StatusOK || r.TokensEntrada+r.TokensSaida+r.TokensCacheEscrita+r.TokensCacheLeitura > 0 {
 		p, conhecido := precoDoModelo(r.Modelo)
+		if r.estimado {
+			p, conhecido = precoMaisCaro, false
+		}
 		r.PrecoConhecido = conhecido
 		r.Custo = custoDe(p, usoMedido{
 			Entrada: r.TokensEntrada, Saida: r.TokensSaida, CacheLeitura: r.TokensCacheLeitura,
 			CacheEscrita5m: r.TokensCacheEscrita - r.cache1h, CacheEscrita1h: r.cache1h,
 		})
-		if !conhecido {
+		if !conhecido && !r.estimado {
 			t.log.Warn("iauso: modelo fora da tabela de precos; custo pelo mais caro", "modelo", r.Modelo)
 		}
 	} else {
@@ -360,24 +428,40 @@ func lerSSE(b []byte) Registro {
 }
 
 // leitorSSE repassa o stream e, no fim, entrega tudo o que passou para fim().
+// errLeitura e nil quando o stream terminou normalmente (EOF).
 type leitorSSE struct {
 	orig io.ReadCloser
+	mu   sync.Mutex
 	buf  bytes.Buffer
-	fim  func([]byte)
+	fim  func(b []byte, errLeitura error)
 	once sync.Once
+}
+
+func (l *leitorSSE) terminar(err error) {
+	l.once.Do(func() {
+		l.mu.Lock()
+		b := append([]byte(nil), l.buf.Bytes()...)
+		l.mu.Unlock()
+		l.fim(b, err)
+	})
 }
 
 func (l *leitorSSE) Read(p []byte) (int, error) {
 	n, err := l.orig.Read(p)
+	l.mu.Lock()
 	l.buf.Write(p[:n])
-	if err != nil {
-		l.once.Do(func() { l.fim(l.buf.Bytes()) })
+	l.mu.Unlock()
+	if err == io.EOF {
+		l.terminar(nil)
+	} else if err != nil {
+		l.terminar(err)
 	}
 	return n, err
 }
 
+// Close antes do fim (quem chamou desistiu) conta como stream cortado.
 func (l *leitorSSE) Close() error {
-	l.once.Do(func() { l.fim(l.buf.Bytes()) })
+	l.terminar(errors.New("stream fechado antes do fim"))
 	return l.orig.Close()
 }
 
@@ -399,14 +483,6 @@ func porCorpo(r *http.Request, corpo []byte) {
 	r.Body = io.NopCloser(bytes.NewReader(corpo))
 	r.ContentLength = int64(len(corpo))
 	r.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(corpo)), nil }
-}
-
-func modeloPedido(corpo []byte) string {
-	var v struct {
-		Model string `json:"model"`
-	}
-	_ = json.Unmarshal(corpo, &v)
-	return v.Model
 }
 
 func removerCabecalhosImobo(h http.Header) {

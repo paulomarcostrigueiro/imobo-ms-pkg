@@ -9,7 +9,7 @@
 //
 //  1. descobre de onde veio (servico, funcionalidade, tenant, conversa) e de qual
 //     organizacao da Anthropic e a chave (ou se e a chave propria do tenant);
-//  2. confere o teto mensal da organizacao e, se ja estourou, devolve 429 sem
+//  2. confere o teto mensal da organizacao e, se ja estourou, devolve 402 sem
 //     chamar a Anthropic;
 //  3. chama a Anthropic (ou o ia-service, conforme o modo);
 //  4. le o `usage` da resposta, calcula o custo com o preco do modelo
